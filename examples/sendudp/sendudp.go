@@ -9,7 +9,6 @@ import (
 	"encoding/hex"
 	"flag"
 	"fmt"
-	"math"
 	"net"
 	"time"
 
@@ -39,6 +38,8 @@ func main() {
 	flag.UintVar(&SrcPort, "srcport", 1234, "Source UDP port.")
 	flag.UintVar(&DstPort, "dstport", 1234, "Destination UDP port.")
 	flag.UintVar(&PayloadSize, "payloadsize", 1400, "Size of the UDP payload.")
+	flag.IntVar(&xdp.DefaultNumRxDescs, "rxringcap", 128, "Capacity of Rx ring queue.")
+	flag.IntVar(&xdp.DefaultNumTxDescs, "txringcap", 128, "Capacity of Tx ring queue.")
 	flag.Parse()
 
 	// Initialize the XDP socket.
@@ -52,6 +53,7 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
+	defer xsk.Close()
 
 	// Pre-generate a frame containing a DNS query.
 
@@ -95,7 +97,8 @@ func main() {
 
 	// Fill all the frames in UMEM with the pre-generated UDP packet.
 
-	descs := xsk.GetDescs(math.MaxInt32)
+	// FIXME add NumDescs method to xsk?
+	descs := xsk.GetDescs(xsk.NumFreeTxSlots())
 	for i, _ := range descs {
 		frameLen = copy(xsk.GetFrame(descs[i]), buf.Bytes())
 	}
@@ -110,27 +113,33 @@ func main() {
 		var err error
 		var prev xdp.Stats
 		var cur xdp.Stats
-		var numPkts uint64
 		for i := uint64(0); ; i++ {
 			time.Sleep(time.Duration(1)*time.Second)
 			cur, err = xsk.Stats()
 			if err != nil {
 				panic(err)
 			}
-			numPkts = cur.Completed - prev.Completed
+			numFilled := cur.Filled - prev.Filled
+			numRx := cur.Received - prev.Received
+			numTx := cur.Transmitted - prev.Transmitted
+			numComplete := cur.Completed - prev.Completed
+			numPkts := numComplete
 			fmt.Printf("%d packets/s (%d Mb/s)\n", numPkts, (numPkts * uint64(frameLen) * 8)/(1000*1000))
+			fmt.Printf("  numFilled=%d numRx=%d numTx=%d numComplete=%d (%d Mb/s)\n", numFilled, numRx, numTx, numComplete, (numComplete * uint64(frameLen) * 8)/(1000*1000))
+			fmt.Printf("  Rx_dropped=%d Rx_invalid_descs=%d Tx_invalid_descs=%d\n", cur.KernelStats.Rx_dropped, cur.KernelStats.Rx_invalid_descs, cur.KernelStats.Tx_invalid_descs)
 			prev = cur
 		}
 	}()
 
+	var i int
 	for {
-		descs := xsk.GetDescs(xsk.NumFreeTxSlots())
-		for i, _ := range descs {
+		descs = xsk.GetDescs(xsk.NumFreeTxSlots())
+		for i = 0; i < len(descs); i++ {
 			descs[i].Len = uint32(frameLen)
 		}
 		xsk.Transmit(descs)
 
-		_, _, err = xsk.Poll(-1)
+		_, _, err := xsk.Poll(-1)
 		if err != nil {
 			panic(err)
 		}

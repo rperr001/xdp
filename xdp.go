@@ -15,7 +15,7 @@ NOTE:
 
 * If your network link device supports multiple queues - you might
 not see all of the incoming traffic because it might be e.g. load-balanced
-between multiple queues. You can use the `ethtool -L` command to control the 
+between multiple queues. You can use the `ethtool -L` command to control the
 load-balancing behaviour or even make it so that all of the incoming traffic
 is put on a single queue.
 
@@ -34,26 +34,26 @@ Here is a minimal example of a program which receives network frames,
 modifies their destination MAC address in-place to broadcast address and
 transmits them back out the same network link:
 	package main
-	
+
 	import (
 		"github.com/asavie/xdp"
 		"github.com/vishvananda/netlink"
 	)
-	
+
 	func main() {
 		const LinkName = "enp3s0"
 		const QueueID = 0
-	
+
 		link, err := netlink.LinkByName(LinkName)
 		if err != nil {
 			panic(err)
 		}
-	
+
 		xsk, err := xdp.NewSocket(link.Attrs().Index, QueueID)
 		if err != nil {
 			panic(err)
 		}
-	
+
 		for {
 			xsk.Fill(xsk.GetDescs(xsk.NumFreeFillSlots()))
 			numRx, _, err := xsk.Poll(-1)
@@ -79,8 +79,8 @@ import (
 	"fmt"
 	"reflect"
 	"syscall"
-	"unsafe"
 	"time"
+	"unsafe"
 
 	"golang.org/x/sys/unix"
 
@@ -91,42 +91,46 @@ import (
 )
 
 const (
-	NumFrames = 128
-	FrameSize = 2048
-	FillRingNumDescs = 64
-	CompletionRingNumDescs = 64
-	RxRingNumDescs = 64
-	TxRingNumDescs = 64
-	DescBatchSize = 16
+	FrameSize   = 2048
+	TxBatchSize = 16
 )
 
 type umemRing struct {
 	Producer *uint32
 	Consumer *uint32
-	Descs []uint64
+	Descs    []uint64
 }
 
 type rxTxRing struct {
 	Producer *uint32
 	Consumer *uint32
-	Descs []unix.XDPDesc
+	Descs    []Desc
 }
 
+// Socket represents an XDP socket, it can only be used from a single
+// goroutine.
 type Socket struct {
-	fd int
-	umem []byte
-	fillRing umemRing
-	rxRing rxTxRing
-	txRing rxTxRing
+	fd             int
+	umem           []byte
+	fillRing       umemRing
+	rxRing         rxTxRing
+	txRing         rxTxRing
 	completionRing umemRing
-	qidconfMap *ebpf.Map
-	xsksMap *ebpf.Map
-	program *ebpf.Program
-	ifindex int
+	qidconfMap     *ebpf.Map
+	xsksMap        *ebpf.Map
+	program        *ebpf.Program
+	ifindex        int
+	numRxDescs     int
+	numTxDescs     int
 	numTransmitted int
-	numFilled int
-	freeDescs []bool
+	numFilled      int
+	freeDescs      []bool
+	getDescs       []Desc // used by Socket.GetDescs method to avoid memory allocation
+	rxDescs        []Desc // used by Socket.Receive method to avoid memroy allocation
 }
+
+// Desc represents an XDP socket ring queue descriptor.
+type Desc unix.XDPDesc
 
 // Stats contains various counters of the XDP socket, such as numbers of
 // sent/received frames.
@@ -152,6 +156,19 @@ type Stats struct {
 	// submitted into Fill or Tx ring queues.
 	KernelStats unix.XDPStatistics
 }
+
+// DefaultNumRxDescs is the size of the Rx ring queue. Having a bigger Rx ring
+// queue might help to handle short bursts of traffic better, but can lead to
+// "bad-put" and a standing queue too. See also DefaultNumTxDescs.
+// This MUST be set to a power of 2 value.
+var DefaultNumRxDescs int = 64
+
+// DefaultNumTxDescs is the size of the Tx ring queue. This can dramatically
+// impact Tx performance, e.g. if you're sending a lot of small frames, you
+// might want to increase this, to reduce the overhead of system calls.
+// See also DefaultNumRxDescs.
+// This MUST be set to a power of 2 value.
+var DefaultNumTxDescs int = 64
 
 // DefaultSocketFlags are the flags which are passed to bind(2) system call
 // when the XDP socket is bound, possible values include unix.XDP_SHARED_UMEM,
@@ -199,18 +216,22 @@ func NewSocket(Ifindex int, QueueID int) (xsk *Socket, err error) {
 		return nil, fmt.Errorf("syscall.Socket failed: %v", err)
 	}
 
-	xsk.umem, err = syscall.Mmap(-1, 0, NumFrames*FrameSize,
-		syscall.PROT_READ | syscall.PROT_WRITE,
-		syscall.MAP_PRIVATE | syscall.MAP_ANONYMOUS | syscall.MAP_POPULATE)
+	xsk.numRxDescs = DefaultNumRxDescs
+	xsk.numTxDescs = DefaultNumTxDescs
+
+	xsk.umem, err = syscall.Mmap(-1, 0,
+		(xsk.numRxDescs+xsk.numTxDescs)*FrameSize,
+		syscall.PROT_READ|syscall.PROT_WRITE,
+		syscall.MAP_PRIVATE|syscall.MAP_ANONYMOUS|syscall.MAP_POPULATE)
 	if err != nil {
 		xsk.Close()
 		return nil, fmt.Errorf("syscall.Mmap failed: %v", err)
 	}
 
 	xdpUmemReg := unix.XDPUmemReg{
-		Addr: uint64(uintptr(unsafe.Pointer(&xsk.umem[0]))),
-		Len: uint64(len(xsk.umem)),
-		Size: FrameSize,
+		Addr:     uint64(uintptr(unsafe.Pointer(&xsk.umem[0]))),
+		Len:      uint64(len(xsk.umem)),
+		Size:     FrameSize,
 		Headroom: 0,
 	}
 
@@ -227,28 +248,28 @@ func NewSocket(Ifindex int, QueueID int) (xsk *Socket, err error) {
 	}
 
 	err = syscall.SetsockoptInt(xsk.fd, unix.SOL_XDP, unix.XDP_UMEM_FILL_RING,
-		FillRingNumDescs)
+		xsk.numRxDescs)
 	if err != nil {
 		xsk.Close()
 		return nil, fmt.Errorf("unix.SetsockoptUint64 XDP_UMEM_FILL_RING failed: %v", err)
 	}
 
 	err = unix.SetsockoptInt(xsk.fd, unix.SOL_XDP, unix.XDP_UMEM_COMPLETION_RING,
-		CompletionRingNumDescs)
+		xsk.numTxDescs)
 	if err != nil {
 		xsk.Close()
 		return nil, fmt.Errorf("unix.SetsockoptUint64 XDP_UMEM_COMPLETION_RING failed: %v", err)
 	}
 
 	err = unix.SetsockoptInt(xsk.fd, unix.SOL_XDP, unix.XDP_RX_RING,
-		RxRingNumDescs)
+		xsk.numRxDescs)
 	if err != nil {
 		xsk.Close()
 		return nil, fmt.Errorf("unix.SetsockoptUint64 XDP_RX_RING failed: %v", err)
 	}
 
 	err = unix.SetsockoptInt(xsk.fd, unix.SOL_XDP, unix.XDP_TX_RING,
-		TxRingNumDescs)
+		xsk.numTxDescs)
 	if err != nil {
 		xsk.Close()
 		return nil, fmt.Errorf("unix.SetsockoptUint64 XDP_TX_RING failed: %v", err)
@@ -267,9 +288,9 @@ func NewSocket(Ifindex int, QueueID int) (xsk *Socket, err error) {
 	}
 
 	fillRingSlice, err := syscall.Mmap(xsk.fd, unix.XDP_UMEM_PGOFF_FILL_RING,
-		int(offsets.Fr.Desc + FillRingNumDescs * uint64(unsafe.Sizeof(uint64(0)))),
-		syscall.PROT_READ | syscall.PROT_WRITE,
-		syscall.MAP_SHARED | syscall.MAP_POPULATE)
+		int(offsets.Fr.Desc+uint64(xsk.numRxDescs)*uint64(unsafe.Sizeof(uint64(0)))),
+		syscall.PROT_READ|syscall.PROT_WRITE,
+		syscall.MAP_SHARED|syscall.MAP_POPULATE)
 	if err != nil {
 		xsk.Close()
 		return nil, fmt.Errorf("syscall.Mmap XDP_UMEM_PGOFF_FILL_RING failed: %v", err)
@@ -279,13 +300,13 @@ func NewSocket(Ifindex int, QueueID int) (xsk *Socket, err error) {
 	xsk.fillRing.Consumer = (*uint32)(unsafe.Pointer(uintptr(unsafe.Pointer(&fillRingSlice[0])) + uintptr(offsets.Fr.Consumer)))
 	sh := (*reflect.SliceHeader)(unsafe.Pointer(&xsk.fillRing.Descs))
 	sh.Data = uintptr(unsafe.Pointer(&fillRingSlice[0])) + uintptr(offsets.Fr.Desc)
-	sh.Len = FillRingNumDescs
-	sh.Cap = FillRingNumDescs
+	sh.Len = xsk.numRxDescs
+	sh.Cap = xsk.numRxDescs
 
 	completionRingSlice, err := syscall.Mmap(xsk.fd, unix.XDP_UMEM_PGOFF_COMPLETION_RING,
-		int(offsets.Cr.Desc + CompletionRingNumDescs * uint64(unsafe.Sizeof(uint64(0)))),
-		syscall.PROT_READ | syscall.PROT_WRITE,
-		syscall.MAP_SHARED | syscall.MAP_POPULATE)
+		int(offsets.Cr.Desc+uint64(xsk.numTxDescs)*uint64(unsafe.Sizeof(uint64(0)))),
+		syscall.PROT_READ|syscall.PROT_WRITE,
+		syscall.MAP_SHARED|syscall.MAP_POPULATE)
 	if err != nil {
 		xsk.Close()
 		return nil, fmt.Errorf("syscall.Mmap XDP_UMEM_PGOFF_COMPLETION_RING failed: %v", err)
@@ -295,13 +316,13 @@ func NewSocket(Ifindex int, QueueID int) (xsk *Socket, err error) {
 	xsk.completionRing.Consumer = (*uint32)(unsafe.Pointer(uintptr(unsafe.Pointer(&completionRingSlice[0])) + uintptr(offsets.Cr.Consumer)))
 	sh = (*reflect.SliceHeader)(unsafe.Pointer(&xsk.completionRing.Descs))
 	sh.Data = uintptr(unsafe.Pointer(&completionRingSlice[0])) + uintptr(offsets.Cr.Desc)
-	sh.Len = CompletionRingNumDescs
-	sh.Cap = CompletionRingNumDescs
+	sh.Len = xsk.numTxDescs
+	sh.Cap = xsk.numTxDescs
 
 	rxRingSlice, err := syscall.Mmap(xsk.fd, unix.XDP_PGOFF_RX_RING,
-		int(offsets.Rx.Desc + RxRingNumDescs * uint64(unsafe.Sizeof(unix.XDPDesc{}))),
-		syscall.PROT_READ | syscall.PROT_WRITE,
-		syscall.MAP_SHARED | syscall.MAP_POPULATE)
+		int(offsets.Rx.Desc+uint64(xsk.numRxDescs)*uint64(unsafe.Sizeof(Desc{}))),
+		syscall.PROT_READ|syscall.PROT_WRITE,
+		syscall.MAP_SHARED|syscall.MAP_POPULATE)
 	if err != nil {
 		xsk.Close()
 		return nil, fmt.Errorf("syscall.Mmap XDP_PGOFF_RX_RING failed: %v", err)
@@ -311,13 +332,13 @@ func NewSocket(Ifindex int, QueueID int) (xsk *Socket, err error) {
 	xsk.rxRing.Consumer = (*uint32)(unsafe.Pointer(uintptr(unsafe.Pointer(&rxRingSlice[0])) + uintptr(offsets.Rx.Consumer)))
 	sh = (*reflect.SliceHeader)(unsafe.Pointer(&xsk.rxRing.Descs))
 	sh.Data = uintptr(unsafe.Pointer(&rxRingSlice[0])) + uintptr(offsets.Rx.Desc)
-	sh.Len = RxRingNumDescs
-	sh.Cap = RxRingNumDescs
+	sh.Len = xsk.numRxDescs
+	sh.Cap = xsk.numRxDescs
 
 	txRingSlice, err := syscall.Mmap(xsk.fd, unix.XDP_PGOFF_TX_RING,
-		int(offsets.Tx.Desc + TxRingNumDescs * uint64(unsafe.Sizeof(unix.XDPDesc{}))),
-		syscall.PROT_READ | syscall.PROT_WRITE,
-		syscall.MAP_SHARED | syscall.MAP_POPULATE)
+		int(offsets.Tx.Desc+uint64(xsk.numTxDescs)*uint64(unsafe.Sizeof(Desc{}))),
+		syscall.PROT_READ|syscall.PROT_WRITE,
+		syscall.MAP_SHARED|syscall.MAP_POPULATE)
 	if err != nil {
 		xsk.Close()
 		return nil, fmt.Errorf("syscall.Mmap XDP_PGOFF_TX_RING failed: %v", err)
@@ -327,11 +348,11 @@ func NewSocket(Ifindex int, QueueID int) (xsk *Socket, err error) {
 	xsk.txRing.Consumer = (*uint32)(unsafe.Pointer(uintptr(unsafe.Pointer(&txRingSlice[0])) + uintptr(offsets.Tx.Consumer)))
 	sh = (*reflect.SliceHeader)(unsafe.Pointer(&xsk.txRing.Descs))
 	sh.Data = uintptr(unsafe.Pointer(&txRingSlice[0])) + uintptr(offsets.Tx.Desc)
-	sh.Len = TxRingNumDescs
-	sh.Cap = TxRingNumDescs
+	sh.Len = xsk.numTxDescs
+	sh.Cap = xsk.numTxDescs
 
 	sa := unix.SockaddrXDP{
-		Flags: DefaultSocketFlags,
+		Flags:   DefaultSocketFlags,
 		Ifindex: uint32(Ifindex),
 		QueueID: uint32(QueueID),
 	}
@@ -343,131 +364,131 @@ func NewSocket(Ifindex int, QueueID int) (xsk *Socket, err error) {
 	const BpfMapTypeXskMap = 17
 
 	xsk.qidconfMap, err = ebpf.NewMap(&ebpf.MapSpec{
-			Name: "qidconf_map",
-			Type: ebpf.Array,
-			KeySize: uint32(unsafe.Sizeof(int32(0))),
-			ValueSize: uint32(unsafe.Sizeof(int32(0))),
-			MaxEntries: uint32(QueueID+1),
-			Flags: 0,
-			InnerMap: nil,
-		})
+		Name:       "qidconf_map",
+		Type:       ebpf.Array,
+		KeySize:    uint32(unsafe.Sizeof(int32(0))),
+		ValueSize:  uint32(unsafe.Sizeof(int32(0))),
+		MaxEntries: uint32(QueueID + 1),
+		Flags:      0,
+		InnerMap:   nil,
+	})
 	if err != nil {
 		xsk.Close()
 		return nil, fmt.Errorf("ebpf.NewMap qidconf_map failed (try increasing RLIMIT_MEMLOCK): %v", err)
 	}
 
 	xsk.xsksMap, err = ebpf.NewMap(&ebpf.MapSpec{
-			Name: "xsks_map",
-			Type: BpfMapTypeXskMap,
-			KeySize: uint32(unsafe.Sizeof(int32(0))),
-			ValueSize: uint32(unsafe.Sizeof(int32(0))),
-			MaxEntries: uint32(QueueID+1),
-			Flags: 0,
-			InnerMap: nil,
-		})
+		Name:       "xsks_map",
+		Type:       BpfMapTypeXskMap,
+		KeySize:    uint32(unsafe.Sizeof(int32(0))),
+		ValueSize:  uint32(unsafe.Sizeof(int32(0))),
+		MaxEntries: uint32(QueueID + 1),
+		Flags:      0,
+		InnerMap:   nil,
+	})
 	if err != nil {
 		xsk.Close()
 		return nil, fmt.Errorf("ebpf.NewMap xsks_map failed (try increasing RLIMIT_MEMLOCK): %v", err)
 	}
 
-/*
-	This is a translation of the default eBPF XDP program found in the
-	xsk_load_xdp_prog() function in <linux>/tools/lib/bpf/xsk.c:
-	https://github.com/torvalds/linux/blob/master/tools/lib/bpf/xsk.c#L259
+	/*
+		This is a translation of the default eBPF XDP program found in the
+		xsk_load_xdp_prog() function in <linux>/tools/lib/bpf/xsk.c:
+		https://github.com/torvalds/linux/blob/master/tools/lib/bpf/xsk.c#L259
 
-	// This is the C-program:
-	// SEC("xdp_sock") int xdp_sock_prog(struct xdp_md *ctx)
-	// {
-	//     int *qidconf, index = ctx->rx_queue_index;
-	//
-	//     // A set entry here means that the correspnding queue_id
-	//     // has an active AF_XDP socket bound to it.
-	//     qidconf = bpf_map_lookup_elem(&qidconf_map, &index);
-	//     if (!qidconf)
-	//         return XDP_ABORTED;
-	//
-	//     if (*qidconf)
-	//         return bpf_redirect_map(&xsks_map, index, 0);
-	//
-	//     return XDP_PASS;
-	// }
-	//
-	struct bpf_insn prog[] = {
-		// r1 = *(u32 *)(r1 + 16) 
-		BPF_LDX_MEM(BPF_W, BPF_REG_1, BPF_REG_1, 16),   // 0
-		// *(u32 *)(r10 - 4) = r1 
-		BPF_STX_MEM(BPF_W, BPF_REG_10, BPF_REG_1, -4),  // 1
-		BPF_MOV64_REG(BPF_REG_2, BPF_REG_10),           // 2
-		BPF_ALU64_IMM(BPF_ADD, BPF_REG_2, -4),          // 3
-		BPF_LD_MAP_FD(BPF_REG_1, xsk->qidconf_map_fd),  // 4 (2 instructions)
-		BPF_EMIT_CALL(BPF_FUNC_map_lookup_elem),        // 5
-		BPF_MOV64_REG(BPF_REG_1, BPF_REG_0),            // 6
-		BPF_MOV32_IMM(BPF_REG_0, 0),                    // 7
-		// if r1 == 0 goto +8 
-		BPF_JMP_IMM(BPF_JEQ, BPF_REG_1, 0, 8),          // 8
-		BPF_MOV32_IMM(BPF_REG_0, 2),                    // 9
-		// r1 = *(u32 *)(r1 + 0) 
-		BPF_LDX_MEM(BPF_W, BPF_REG_1, BPF_REG_1, 0),    // 10
-		// if r1 == 0 goto +5
-		BPF_JMP_IMM(BPF_JEQ, BPF_REG_1, 0, 5),          // 11
-		// r2 = *(u32 *)(r10 - 4)
-		BPF_LD_MAP_FD(BPF_REG_1, xsk->xsks_map_fd),     // 12 (2 instructions)
-		BPF_LDX_MEM(BPF_W, BPF_REG_2, BPF_REG_10, -4),  // 13
-		BPF_MOV32_IMM(BPF_REG_3, 0),                    // 14
-		BPF_EMIT_CALL(BPF_FUNC_redirect_map),           // 15
-		// The jumps are to this instruction 
-		BPF_EXIT_INSN(),                                // 16
-	};
+		// This is the C-program:
+		// SEC("xdp_sock") int xdp_sock_prog(struct xdp_md *ctx)
+		// {
+		//     int *qidconf, index = ctx->rx_queue_index;
+		//
+		//     // A set entry here means that the correspnding queue_id
+		//     // has an active AF_XDP socket bound to it.
+		//     qidconf = bpf_map_lookup_elem(&qidconf_map, &index);
+		//     if (!qidconf)
+		//         return XDP_ABORTED;
+		//
+		//     if (*qidconf)
+		//         return bpf_redirect_map(&xsks_map, index, 0);
+		//
+		//     return XDP_PASS;
+		// }
+		//
+		struct bpf_insn prog[] = {
+			// r1 = *(u32 *)(r1 + 16)
+			BPF_LDX_MEM(BPF_W, BPF_REG_1, BPF_REG_1, 16),   // 0
+			// *(u32 *)(r10 - 4) = r1
+			BPF_STX_MEM(BPF_W, BPF_REG_10, BPF_REG_1, -4),  // 1
+			BPF_MOV64_REG(BPF_REG_2, BPF_REG_10),           // 2
+			BPF_ALU64_IMM(BPF_ADD, BPF_REG_2, -4),          // 3
+			BPF_LD_MAP_FD(BPF_REG_1, xsk->qidconf_map_fd),  // 4 (2 instructions)
+			BPF_EMIT_CALL(BPF_FUNC_map_lookup_elem),        // 5
+			BPF_MOV64_REG(BPF_REG_1, BPF_REG_0),            // 6
+			BPF_MOV32_IMM(BPF_REG_0, 0),                    // 7
+			// if r1 == 0 goto +8
+			BPF_JMP_IMM(BPF_JEQ, BPF_REG_1, 0, 8),          // 8
+			BPF_MOV32_IMM(BPF_REG_0, 2),                    // 9
+			// r1 = *(u32 *)(r1 + 0)
+			BPF_LDX_MEM(BPF_W, BPF_REG_1, BPF_REG_1, 0),    // 10
+			// if r1 == 0 goto +5
+			BPF_JMP_IMM(BPF_JEQ, BPF_REG_1, 0, 5),          // 11
+			// r2 = *(u32 *)(r10 - 4)
+			BPF_LD_MAP_FD(BPF_REG_1, xsk->xsks_map_fd),     // 12 (2 instructions)
+			BPF_LDX_MEM(BPF_W, BPF_REG_2, BPF_REG_10, -4),  // 13
+			BPF_MOV32_IMM(BPF_REG_3, 0),                    // 14
+			BPF_EMIT_CALL(BPF_FUNC_redirect_map),           // 15
+			// The jumps are to this instruction
+			BPF_EXIT_INSN(),                                // 16
+		};
 
-	eBPF instructions:
-	  0: code: 97 dst_reg: 1 src_reg: 1 off: 16 imm: 0   // 0
-	  1: code: 99 dst_reg: 10 src_reg: 1 off: -4 imm: 0  // 1
-	  2: code: 191 dst_reg: 2 src_reg: 10 off: 0 imm: 0  // 2
-	  3: code: 7 dst_reg: 2 src_reg: 0 off: 0 imm: -4    // 3
-	  4: code: 24 dst_reg: 1 src_reg: 1 off: 0 imm: 4    // 4 XXX use qidconfMap.FD as IMM
-	  5: code: 0 dst_reg: 0 src_reg: 0 off: 0 imm: 0     //   part of the same instruction
-	  6: code: 133 dst_reg: 0 src_reg: 0 off: 0 imm: 1   // 5
-	  7: code: 191 dst_reg: 1 src_reg: 0 off: 0 imm: 0   // 6
-	  8: code: 180 dst_reg: 0 src_reg: 0 off: 0 imm: 0   // 7
-	  9: code: 21 dst_reg: 1 src_reg: 0 off: 8 imm: 0    // 8
-	  10: code: 180 dst_reg: 0 src_reg: 0 off: 0 imm: 2  // 9
-	  11: code: 97 dst_reg: 1 src_reg: 1 off: 0 imm: 0   // 10
-	  12: code: 21 dst_reg: 1 src_reg: 0 off: 5 imm: 0   // 11
-	  13: code: 24 dst_reg: 1 src_reg: 1 off: 0 imm: 5   // 12 XXX use xsksMap.FD as IMM
-	  14: code: 0 dst_reg: 0 src_reg: 0 off: 0 imm: 0    //    part of the same instruction
-	  15: code: 97 dst_reg: 2 src_reg: 10 off: -4 imm: 0 // 13
-	  16: code: 180 dst_reg: 3 src_reg: 0 off: 0 imm: 0  // 14
-	  17: code: 133 dst_reg: 0 src_reg: 0 off: 0 imm: 51 // 15
-	  18: code: 149 dst_reg: 0 src_reg: 0 off: 0 imm: 0  // 16
-*/
+		eBPF instructions:
+		  0: code: 97 dst_reg: 1 src_reg: 1 off: 16 imm: 0   // 0
+		  1: code: 99 dst_reg: 10 src_reg: 1 off: -4 imm: 0  // 1
+		  2: code: 191 dst_reg: 2 src_reg: 10 off: 0 imm: 0  // 2
+		  3: code: 7 dst_reg: 2 src_reg: 0 off: 0 imm: -4    // 3
+		  4: code: 24 dst_reg: 1 src_reg: 1 off: 0 imm: 4    // 4 XXX use qidconfMap.FD as IMM
+		  5: code: 0 dst_reg: 0 src_reg: 0 off: 0 imm: 0     //   part of the same instruction
+		  6: code: 133 dst_reg: 0 src_reg: 0 off: 0 imm: 1   // 5
+		  7: code: 191 dst_reg: 1 src_reg: 0 off: 0 imm: 0   // 6
+		  8: code: 180 dst_reg: 0 src_reg: 0 off: 0 imm: 0   // 7
+		  9: code: 21 dst_reg: 1 src_reg: 0 off: 8 imm: 0    // 8
+		  10: code: 180 dst_reg: 0 src_reg: 0 off: 0 imm: 2  // 9
+		  11: code: 97 dst_reg: 1 src_reg: 1 off: 0 imm: 0   // 10
+		  12: code: 21 dst_reg: 1 src_reg: 0 off: 5 imm: 0   // 11
+		  13: code: 24 dst_reg: 1 src_reg: 1 off: 0 imm: 5   // 12 XXX use xsksMap.FD as IMM
+		  14: code: 0 dst_reg: 0 src_reg: 0 off: 0 imm: 0    //    part of the same instruction
+		  15: code: 97 dst_reg: 2 src_reg: 10 off: -4 imm: 0 // 13
+		  16: code: 180 dst_reg: 3 src_reg: 0 off: 0 imm: 0  // 14
+		  17: code: 133 dst_reg: 0 src_reg: 0 off: 0 imm: 51 // 15
+		  18: code: 149 dst_reg: 0 src_reg: 0 off: 0 imm: 0  // 16
+	*/
 
 	xsk.program, err = ebpf.NewProgram(&ebpf.ProgramSpec{
-			Name: "xsk_ebpf",
-			Type: ebpf.XDP,
-			Instructions: asm.Instructions{
-				{ OpCode: 97, Dst: 1, Src: 1, Offset: 16 },                                      // 0: code: 97 dst_reg: 1 src_reg: 1 off: 16 imm: 0   // 0
-				{ OpCode: 99, Dst: 10, Src: 1, Offset: -4 },                                     // 1: code: 99 dst_reg: 10 src_reg: 1 off: -4 imm: 0  // 1
-				{ OpCode: 191, Dst: 2, Src: 10 },                                                // 2: code: 191 dst_reg: 2 src_reg: 10 off: 0 imm: 0  // 2
-				{ OpCode: 7, Dst: 2, Src: 0, Offset: 0, Constant: -4 },                          // 3: code: 7 dst_reg: 2 src_reg: 0 off: 0 imm: -4    // 3
-				{ OpCode: 24, Dst: 1, Src: 1, Offset: 0, Constant: int64(xsk.qidconfMap.FD()) }, // 4: code: 24 dst_reg: 1 src_reg: 1 off: 0 imm: 4    // 4 XXX use qidconfMap.FD as IMM
-				//{ OpCode: 0 },                                                                 // 5: code: 0 dst_reg: 0 src_reg: 0 off: 0 imm: 0     //   part of the same instruction
-				{ OpCode: 133, Dst: 0, Src: 0, Constant: 1 },                                    // 6: code: 133 dst_reg: 0 src_reg: 0 off: 0 imm: 1   // 5
-				{ OpCode: 191, Dst: 1, Src: 0 },                                                 // 7: code: 191 dst_reg: 1 src_reg: 0 off: 0 imm: 0   // 6
-				{ OpCode: 180, Dst: 0, Src: 0 },                                                 // 8: code: 180 dst_reg: 0 src_reg: 0 off: 0 imm: 0   // 7
-				{ OpCode: 21, Dst: 1, Src: 0, Offset: 8 },                                       // 9: code: 21 dst_reg: 1 src_reg: 0 off: 8 imm: 0    // 8
-				{ OpCode: 180, Dst: 0, Src: 0, Constant: 2 },                                    // 10: code: 180 dst_reg: 0 src_reg: 0 off: 0 imm: 2  // 9
-				{ OpCode: 97, Dst: 1, Src: 1 },                                                  // 11: code: 97 dst_reg: 1 src_reg: 1 off: 0 imm: 0   // 10
-				{ OpCode: 21, Dst: 1, Offset: 5 },                                               // 12: code: 21 dst_reg: 1 src_reg: 0 off: 5 imm: 0   // 11
-				{ OpCode: 24, Dst: 1, Src: 1, Constant: int64(xsk.xsksMap.FD()) },               // 13: code: 24 dst_reg: 1 src_reg: 1 off: 0 imm: 5   // 12 XXX use xsksMap.FD as IMM
-				//{ OpCode: 0 },                                                                 // 14: code: 0 dst_reg: 0 src_reg: 0 off: 0 imm: 0    //    part of the same instruction
-				{ OpCode: 97, Dst: 2, Src: 10, Offset: -4 },                                     // 15: code: 97 dst_reg: 2 src_reg: 10 off: -4 imm: 0 // 13
-				{ OpCode: 180, Dst: 3 },                                                         // 16: code: 180 dst_reg: 3 src_reg: 0 off: 0 imm: 0  // 14
-				{ OpCode: 133, Constant: 51 },                                                   // 17: code: 133 dst_reg: 0 src_reg: 0 off: 0 imm: 51 // 15
-				{ OpCode: 149 },                                                                 // 18: code: 149 dst_reg: 0 src_reg: 0 off: 0 imm: 0  // 16
-			},
-			License: "LGPL-2.1 or BSD-2-Clause",
-			KernelVersion: 0,
-		})
+		Name: "xsk_ebpf",
+		Type: ebpf.XDP,
+		Instructions: asm.Instructions{
+			{OpCode: 97, Dst: 1, Src: 1, Offset: 16},                                      // 0: code: 97 dst_reg: 1 src_reg: 1 off: 16 imm: 0   // 0
+			{OpCode: 99, Dst: 10, Src: 1, Offset: -4},                                     // 1: code: 99 dst_reg: 10 src_reg: 1 off: -4 imm: 0  // 1
+			{OpCode: 191, Dst: 2, Src: 10},                                                // 2: code: 191 dst_reg: 2 src_reg: 10 off: 0 imm: 0  // 2
+			{OpCode: 7, Dst: 2, Src: 0, Offset: 0, Constant: -4},                          // 3: code: 7 dst_reg: 2 src_reg: 0 off: 0 imm: -4    // 3
+			{OpCode: 24, Dst: 1, Src: 1, Offset: 0, Constant: int64(xsk.qidconfMap.FD())}, // 4: code: 24 dst_reg: 1 src_reg: 1 off: 0 imm: 4    // 4 XXX use qidconfMap.FD as IMM
+			//{ OpCode: 0 },                                                                 // 5: code: 0 dst_reg: 0 src_reg: 0 off: 0 imm: 0     //   part of the same instruction
+			{OpCode: 133, Dst: 0, Src: 0, Constant: 1},                      // 6: code: 133 dst_reg: 0 src_reg: 0 off: 0 imm: 1   // 5
+			{OpCode: 191, Dst: 1, Src: 0},                                   // 7: code: 191 dst_reg: 1 src_reg: 0 off: 0 imm: 0   // 6
+			{OpCode: 180, Dst: 0, Src: 0},                                   // 8: code: 180 dst_reg: 0 src_reg: 0 off: 0 imm: 0   // 7
+			{OpCode: 21, Dst: 1, Src: 0, Offset: 8},                         // 9: code: 21 dst_reg: 1 src_reg: 0 off: 8 imm: 0    // 8
+			{OpCode: 180, Dst: 0, Src: 0, Constant: 2},                      // 10: code: 180 dst_reg: 0 src_reg: 0 off: 0 imm: 2  // 9
+			{OpCode: 97, Dst: 1, Src: 1},                                    // 11: code: 97 dst_reg: 1 src_reg: 1 off: 0 imm: 0   // 10
+			{OpCode: 21, Dst: 1, Offset: 5},                                 // 12: code: 21 dst_reg: 1 src_reg: 0 off: 5 imm: 0   // 11
+			{OpCode: 24, Dst: 1, Src: 1, Constant: int64(xsk.xsksMap.FD())}, // 13: code: 24 dst_reg: 1 src_reg: 1 off: 0 imm: 5   // 12 XXX use xsksMap.FD as IMM
+			//{ OpCode: 0 },                                                                 // 14: code: 0 dst_reg: 0 src_reg: 0 off: 0 imm: 0    //    part of the same instruction
+			{OpCode: 97, Dst: 2, Src: 10, Offset: -4}, // 15: code: 97 dst_reg: 2 src_reg: 10 off: -4 imm: 0 // 13
+			{OpCode: 180, Dst: 3},                     // 16: code: 180 dst_reg: 3 src_reg: 0 off: 0 imm: 0  // 14
+			{OpCode: 133, Constant: 51},               // 17: code: 133 dst_reg: 0 src_reg: 0 off: 0 imm: 51 // 15
+			{OpCode: 149},                             // 18: code: 149 dst_reg: 0 src_reg: 0 off: 0 imm: 0  // 16
+		},
+		License:       "LGPL-2.1 or BSD-2-Clause",
+		KernelVersion: 0,
+	})
 	if err != nil {
 		return nil, fmt.Errorf("error: ebpf.NewProgram failed: %v", err)
 	}
@@ -487,10 +508,12 @@ func NewSocket(Ifindex int, QueueID int) (xsk *Socket, err error) {
 		return nil, fmt.Errorf("failed to update xsksMap: %v", err)
 	}
 
-	xsk.freeDescs = make([]bool, NumFrames)
-	for i := 0; i < NumFrames; i++ {
+	xsk.freeDescs = make([]bool, xsk.numRxDescs+xsk.numTxDescs)
+	for i, _ := range xsk.freeDescs {
 		xsk.freeDescs[i] = true
 	}
+	xsk.getDescs = make([]Desc, xsk.numRxDescs+xsk.numTxDescs)
+	xsk.rxDescs = make([]Desc, xsk.numRxDescs)
 
 	return xsk, nil
 }
@@ -499,7 +522,7 @@ func NewSocket(Ifindex int, QueueID int) (xsk *Socket, err error) {
 // it returns how many descriptors where actually put onto Fill ring queue.
 // The descriptors can be acquired either by calling the GetDescs() method or
 // by calling Receive() method.
-func (xsk *Socket) Fill(descs []unix.XDPDesc) int {
+func (xsk *Socket) Fill(descs []Desc) int {
 	numFreeSlots := xsk.NumFreeFillSlots()
 	if numFreeSlots < len(descs) {
 		descs = descs[:numFreeSlots]
@@ -507,9 +530,9 @@ func (xsk *Socket) Fill(descs []unix.XDPDesc) int {
 
 	prod := *xsk.fillRing.Producer
 	for _, desc := range descs {
-		xsk.fillRing.Descs[prod & (FillRingNumDescs-1)] = desc.Addr
+		xsk.fillRing.Descs[prod&uint32((xsk.numRxDescs-1))] = desc.Addr
 		prod++
-		xsk.freeDescs[desc.Addr / FrameSize] = false
+		xsk.freeDescs[desc.Addr/FrameSize] = false
 	}
 	//fencer.SFence()
 	*xsk.fillRing.Producer = prod
@@ -519,35 +542,34 @@ func (xsk *Socket) Fill(descs []unix.XDPDesc) int {
 	return len(descs)
 }
 
-// Receive returns the descriptors which were filled, i.e. into which frames
+// Receive returns up to num descriptors which were filled, i.e. into which frames
 // were received into.
-func (xsk *Socket) Receive(num int) []unix.XDPDesc {
+func (xsk *Socket) Receive(num int) []Desc {
 	numAvailable := xsk.NumReceived()
 	if num > int(numAvailable) {
 		num = int(numAvailable)
 	}
 
-	descs := make([]unix.XDPDesc, num)
 	cons := *xsk.rxRing.Consumer
 	//fencer.LFence()
 	for i := 0; i < num; i++ {
-		descs[i] = xsk.rxRing.Descs[cons & (RxRingNumDescs-1)]
+		xsk.rxDescs[i] = xsk.rxRing.Descs[cons&uint32((xsk.numRxDescs-1))]
 		cons++
-		xsk.freeDescs[descs[i].Addr / FrameSize] = true
+		xsk.freeDescs[xsk.rxDescs[i].Addr/FrameSize] = true
 	}
 	//fencer.MFence()
 	*xsk.rxRing.Consumer = cons
 
-	xsk.numFilled -= len(descs)
+	xsk.numFilled -= num
 
-	return descs
+	return xsk.rxDescs[:num]
 }
 
 // Transmit submits the given descriptors to be sent out, it returns how many
 // descriptors were actually pushed onto the Tx ring queue.
 // The descriptors can be acquired either by calling the GetDescs() method or
 // by calling Receive() method.
-func (xsk *Socket) Transmit(descs []unix.XDPDesc) (numSubmitted int) {
+func (xsk *Socket) Transmit(descs []Desc) (numSubmitted int) {
 	numFreeSlots := xsk.NumFreeTxSlots()
 	if len(descs) > numFreeSlots {
 		descs = descs[:numFreeSlots]
@@ -555,17 +577,30 @@ func (xsk *Socket) Transmit(descs []unix.XDPDesc) (numSubmitted int) {
 
 	prod := *xsk.txRing.Producer
 	for _, desc := range descs {
-		xsk.txRing.Descs[prod & (TxRingNumDescs-1)] = desc
+		xsk.txRing.Descs[prod&uint32((xsk.numTxDescs-1))] = desc
 		prod++
-		xsk.freeDescs[desc.Addr / FrameSize] = false
+		xsk.freeDescs[desc.Addr/FrameSize] = false
 	}
 	//fencer.SFence()
 	*xsk.txRing.Producer = prod
 
-	xsk.numTransmitted += len(descs)
-
 	numSubmitted = len(descs)
+	xsk.numTransmitted += numSubmitted
 
+	// FIXME remove kick here and do it only in Poll?
+	xsk.kickTx()
+
+	return
+}
+
+// kickTx notifies Linux kernel that there are elements available on the Tx
+// ring by means of a sendto(2) system call. In the context of sendto(2) system
+// call, the kernel consumes and transmits up to TxBatchSize elements from the
+// Tx ring, if there are more elements in the ring, then EAGAIN is returned by
+// the kernel.
+// FIXME expose as public method? In that case NumTransmitted() probably shold
+// do real calculation with prod-cons
+func (xsk *Socket) kickTx() {
 	var rc uintptr
 	var errno syscall.Errno
 	for {
@@ -575,21 +610,21 @@ func (xsk *Socket) Transmit(descs []unix.XDPDesc) (numSubmitted int) {
 			uintptr(unix.MSG_DONTWAIT),
 			0, 0)
 		if rc != 0 {
-                       switch errno {
-                       case unix.EINTR: fallthrough
-                       case unix.EAGAIN:
-                               // try again
-                       case unix.EBUSY: // "completed but not sent"
-                               return
-                       default:
-                               panic(fmt.Errorf("sendto failed with rc=%d and errno=%d", rc, errno))
-                       }
+			switch errno {
+			case unix.EINTR:
+				// try again
+			// FIXME report EBUSY to user?
+			case unix.EBUSY: // "SKB completed but not sent"
+				fallthrough
+			case unix.EAGAIN: // more than TxBatchSize was submitted
+				return
+			default:
+				panic(fmt.Errorf("sendto failed with rc=%d and errno=%d", rc, errno))
+			}
 		} else {
 			break
 		}
 	}
-
-	return
 }
 
 // FD returns the file descriptor associated with this xdp.Socket which can be
@@ -601,13 +636,13 @@ func (xsk *Socket) FD() int {
 // Poll blocks until kernel informs us that it has either received
 // or completed (i.e. actually sent) some frames that were previously submitted
 // using Fill() or Transmit() methods.
-// The numReceived return value can be used as the argument for subsequent 
+// The numReceived return value can be used as the argument for subsequent
 // Receive() method call.
 func (xsk *Socket) Poll(timeout int) (numReceived int, numCompleted int, err error) {
 	var events int16
 	var n int
 	var pfds [1]unix.PollFd
-	
+
 	for {
 		events = 0
 		if xsk.numFilled > 0 {
@@ -615,6 +650,7 @@ func (xsk *Socket) Poll(timeout int) (numReceived int, numCompleted int, err err
 		}
 		if xsk.numTransmitted > 0 {
 			events |= unix.POLLOUT
+			xsk.kickTx()
 		}
 		if events == 0 {
 			return
@@ -642,20 +678,23 @@ func (xsk *Socket) Poll(timeout int) (numReceived int, numCompleted int, err err
 		if numReceived > 0 || numCompleted > 0 {
 			return
 		} // else continue - kernel notified it consumed from Tx
+
+		// FIXME kick Tx somewhere in here ???
 	}
 
 	return
 }
 
 // GetDescs returns up to n descriptors which are not currently in use.
-func (xsk *Socket) GetDescs(n int) []unix.XDPDesc {
-	if n > len(xsk.freeDescs) {
-		n = len(xsk.freeDescs)
+func (xsk *Socket) GetDescs(n int) []Desc {
+	descs := xsk.getDescs
+	free := xsk.freeDescs
+	if n > len(free) {
+		n = len(free)
 	}
-	descs := make([]unix.XDPDesc, len(xsk.freeDescs))
 	j := 0
-	for i := 0; i < len(xsk.freeDescs) && j < n; i++ {
-		if xsk.freeDescs[i] == true {
+	for i := 0; i < len(free) && j < n; i++ {
+		if free[i] == true {
 			descs[j].Addr = uint64(i) * FrameSize
 			descs[j].Len = FrameSize
 			j++
@@ -665,10 +704,10 @@ func (xsk *Socket) GetDescs(n int) []unix.XDPDesc {
 }
 
 // GetFrame returns the buffer containing the frame corresponding to the given
-// descriptor. The returned byte slice points to the actual buffer of the 
+// descriptor. The returned byte slice points to the actual buffer of the
 // corresponding frame, so modiyfing this slice modifies the frame contents.
-func (xsk *Socket) GetFrame(d unix.XDPDesc) []byte {
-	return xsk.umem[d.Addr:d.Addr+uint64(d.Len)]
+func (xsk *Socket) GetFrame(d Desc) []byte {
+	return xsk.umem[d.Addr : d.Addr+uint64(d.Len)]
 }
 
 // Close closes and frees the resources allocated by the Socket.
@@ -734,7 +773,7 @@ func (xsk *Socket) Close() error {
 		sh.Len = 0
 		sh.Cap = 0
 	}
-	
+
 	if xsk.umem != nil {
 		if err := syscall.Munmap(xsk.umem); err != nil {
 			allErrors = append(allErrors, fmt.Errorf("failed to unmap the UMEM: %v", err))
@@ -754,9 +793,9 @@ func (xsk *Socket) Complete(n int) {
 	cons := *xsk.completionRing.Consumer
 	//fencer.LFence()
 	for i := 0; i < n; i++ {
-		addr := xsk.completionRing.Descs[cons & (CompletionRingNumDescs-1)]
+		addr := xsk.completionRing.Descs[cons&uint32((xsk.numTxDescs-1))]
 		cons++
-		xsk.freeDescs[addr / FrameSize] = true
+		xsk.freeDescs[addr/FrameSize] = true
 	}
 	//fencer.MFence()
 	*xsk.completionRing.Consumer = cons
@@ -771,12 +810,12 @@ func (xsk *Socket) NumFreeFillSlots() int {
 	prod := *xsk.fillRing.Producer
 	cons := *xsk.fillRing.Consumer
 
-	n := FillRingNumDescs - (prod - cons)
-	if n > FillRingNumDescs {
-		n = FillRingNumDescs
+	n := xsk.numRxDescs - int(prod-cons)
+	if n > xsk.numRxDescs {
+		n = xsk.numRxDescs
 	}
 
-	return int(n)
+	return n
 }
 
 // NumFreeTxSlots returns how many free slots are available on the Tx ring
@@ -786,12 +825,12 @@ func (xsk *Socket) NumFreeTxSlots() int {
 	prod := *xsk.txRing.Producer
 	cons := *xsk.txRing.Consumer
 
-	n := TxRingNumDescs - (prod - cons)
-	if n > TxRingNumDescs {
-		n = TxRingNumDescs
+	n := xsk.numTxDescs - int(prod-cons)
+	if n > xsk.numTxDescs {
+		n = xsk.numTxDescs
 	}
 
-	return int(n)
+	return n
 }
 
 // NumReceived returns how many descriptors are there on the Rx ring queue
@@ -800,12 +839,12 @@ func (xsk *Socket) NumReceived() int {
 	prod := *xsk.rxRing.Producer
 	cons := *xsk.rxRing.Consumer
 
-	n := prod - cons
-	if n > RxRingNumDescs {
-		n = RxRingNumDescs
+	n := int(prod - cons)
+	if n > xsk.numRxDescs {
+		n = xsk.numRxDescs
 	}
 
-	return int(n)
+	return n
 }
 
 // NumCompleted returns how many descriptors are there on the Completion ring
@@ -814,12 +853,12 @@ func (xsk *Socket) NumCompleted() int {
 	prod := *xsk.completionRing.Producer
 	cons := *xsk.completionRing.Consumer
 
-	n := prod - cons
-	if n > CompletionRingNumDescs {
-		n = CompletionRingNumDescs
+	n := int(prod - cons)
+	if n > xsk.numTxDescs {
+		n = xsk.numTxDescs
 	}
 
-	return int(n)
+	return n
 }
 
 // NumFilled returns how many descriptors are there on the Fill ring
@@ -846,22 +885,22 @@ func (xsk *Socket) NumTransmitted() int {
 
 // Stats returns various statistics for this XDP socket.
 func (xsk *Socket) Stats() (Stats, error) {
-       var stats Stats
-       var size uint64
+	var stats Stats
+	var size uint64
 
-       stats.Filled = uint64(*xsk.fillRing.Consumer)
-       stats.Received = uint64(*xsk.rxRing.Consumer)
-       stats.Transmitted = uint64(*xsk.txRing.Consumer)
-       stats.Completed = uint64(*xsk.completionRing.Consumer)
+	stats.Filled = uint64(*xsk.fillRing.Consumer)
+	stats.Received = uint64(*xsk.rxRing.Consumer)
+	stats.Transmitted = uint64(*xsk.txRing.Consumer)
+	stats.Completed = uint64(*xsk.completionRing.Consumer)
 
-       size = uint64(unsafe.Sizeof(stats.KernelStats))
-       rc, _, errno := unix.Syscall6(syscall.SYS_GETSOCKOPT,
-               uintptr(xsk.fd),
-               unix.SOL_XDP, unix.XDP_STATISTICS,
-               uintptr(unsafe.Pointer(&stats.KernelStats)),
-               uintptr(unsafe.Pointer(&size)), 0)
-       if rc != 0 {
-               return stats, fmt.Errorf("getsockopt XDP_STATISTICS failed with errno %d", errno)
-       }
-       return stats, nil
+	size = uint64(unsafe.Sizeof(stats.KernelStats))
+	rc, _, errno := unix.Syscall6(syscall.SYS_GETSOCKOPT,
+		uintptr(xsk.fd),
+		unix.SOL_XDP, unix.XDP_STATISTICS,
+		uintptr(unsafe.Pointer(&stats.KernelStats)),
+		uintptr(unsafe.Pointer(&size)), 0)
+	if rc != 0 {
+		return stats, fmt.Errorf("getsockopt XDP_STATISTICS failed with errno %d", errno)
+	}
+	return stats, nil
 }
